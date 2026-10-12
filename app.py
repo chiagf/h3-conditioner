@@ -509,7 +509,7 @@ with gr.Blocks(title="Qwen3-VL conditioner") as demo:
 
 # RunPod LB health check on the underlying FastAPI app; the gradio app (API routes + inspection UI) mounts at `/`
 # and does not shadow it. 204 while models load, 200 when ready, 5xx pulls the worker from the pool.
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from fastapi import FastAPI
 
@@ -521,7 +521,8 @@ def ping():
     if LOAD_ERROR:
         return JSONResponse({"status": "error", "detail": LOAD_ERROR}, status_code=500)
     if PIPE is None:
-        return JSONResponse({"status": "loading"}, status_code=204)
+        # 204 MUST be bodyless — h11 raises on a JSON payload here, which crashed every LB health check.
+        return Response(status_code=204)
     return JSONResponse({"status": "ok"}, status_code=200)
 
 
