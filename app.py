@@ -13,6 +13,14 @@ strictly additive: `rewrite_prompt=False` is the path that was here before it, u
 from __future__ import annotations
 
 import os
+
+# RunPod workers have only a few GB free on the root disk; the 66.7 GB HF download and temp files go on the
+# network volume instead. Must run before anything imports huggingface_hub (gradio pulls it in).
+if os.path.isdir("/runpod-volume"):
+    os.makedirs("/runpod-volume/tmp", exist_ok=True)
+    os.environ.setdefault("HF_HOME", "/runpod-volume/huggingface-cache")
+    os.environ.setdefault("TMPDIR", "/runpod-volume/tmp")
+
 import tempfile
 import threading
 import time
@@ -132,6 +140,10 @@ def load_models() -> str | None:
         print(f"[cond] loading {[c.name for c in blocks.expected_components]} from {MODEL_REPO} ...", flush=True)
         pipe = blocks.init_pipeline(MODEL_REPO)
         pipe.load_components(dtype=torch.bfloat16)
+        if getattr(pipe, "text_encoder", None) is None:
+            # load_components logs the per-component failure and continues; surface it loudly instead of
+            # dying later on a NoneType (the usual cause: disk full during the download — see worker logs).
+            raise RuntimeError("text_encoder failed to load — check the download errors above")
         pipe.to("cuda")
 
         # The `ref2va` conditioner half declares the same three components, so it is handed the ones that are

@@ -14,6 +14,9 @@ The denoiser half lives in the sibling repo `h3-denoiser` and is the only intend
 - Type: **Load Balancer**, GPU: **A100 80 GB** first choice ($2.72/hr, fits bf16 — HANDOVER §12;
   fall back to RTX PRO 6000 if it OOMs on vision-heavy keyframes + upsample)
 - workersMin 0, workersMax 1, **idleTimeout 300**, Model field: empty (startup download, HANDOVER §11 option A)
+- **Network volume ≥ 100 GB attached** — the worker root disk is only a few GB; the 66.7 GB download
+  goes to `/runpod-volume/huggingface-cache` (the app sets `HF_HOME`/`TMPDIR` automatically when the
+  volume is present). Without a volume the load dies with `No space left on device`.
 
 ## Environment variables
 
