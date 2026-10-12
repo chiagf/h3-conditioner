@@ -1,0 +1,33 @@
+# `diffusers` is installed from the canonical MiniMax-H3 pull request,
+# https://github.com/huggingface/diffusers/pull/14371 ("Minimax h3 follow up (review & refactor)"), pinned to a
+# **commit** rather than to its `minimax-h3-refactor` branch: the PR is a WIP and its head moves, and this Space's
+# blocks subclass its block classes. Re-pin — and re-check `h3_split_blocks.py` against the block names of the new
+# head — whenever the PR updates.
+#
+#   665f578278365ea4a3318cb8c9b66ce6c01204b9 = refs/pull/14371/head at the time of this deploy
+#
+# Nothing is quantized in this deployment, so there is no `torchao`.
+--extra-index-url https://download.pytorch.org/whl/cu130
+diffusers @ git+https://github.com/huggingface/diffusers.git@665f578278365ea4a3318cb8c9b66ce6c01204b9
+torch==2.11.0
+torchvision==0.26.0
+# A reference soundtrack that is not already at the audio VAE's 32 kHz is resampled with `torchaudio`, which is the
+# only thing in the `ref2va` path that needs it — and it is easy to miss, because a 32 kHz reference skips the
+# resample entirely. Both halves need it: the conditioner's `setup` step normalizes the same waveforms this one does.
+torchaudio==2.11.0
+# Pinned to the version the MiniMax-H3 parity work was verified against: the Qwen3-VL processor decides the vision
+# patch count, so a different minor changes the conditioning.
+transformers==5.8.0
+accelerate==1.14.0
+# diffusers pins <2; 1.24.0 is the version the parity work ran on.
+huggingface-hub==1.24.0
+gradio==6.20.0
+spaces==0.51.1
+# No `kernels` pin on purpose: the Hub attention backends want `kernels>=0.12.3`, and that version breaks
+# transformers 5.8.0 at import.
+# PyAV: decoding the reference media, i.e. `MiniMaxH3VideoReference.from_file` / `MiniMaxH3AudioReference.from_file`.
+av
+pillow
+numpy
+requests
+safetensors>=0.8.0
