@@ -1,8 +1,8 @@
 """Qwen3-VL conditioner service.
 
 Encodes a text prompt (optionally with keyframe images or ordered media references) into the embedding
-tensors a downstream video generation Space consumes: `prompt_embeds` and per row token tags, plus the
-resolved generation plan. Runs the 33B Qwen3-VL conditioner unquantized in bfloat16 on ZeroGPU.
+tensors a downstream video generation service consumes: `prompt_embeds` and per row token tags, plus the
+resolved generation plan. Runs the 33B Qwen3-VL conditioner unquantized in bfloat16, resident on the card.
 
 Optionally rewrites the prompt first. The conditioner is the full `Qwen3VLForConditionalGeneration`, language-model
 head and chat template included, so the structured prompt format the video model was actually trained on can be
@@ -14,28 +14,16 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 import traceback
 
-# First, and at module level. On ZeroGPU `import spaces` patches `torch.cuda` so that `is_available()` is True and
-# `get_device_capability()` answers the pool's own (12, 0) before any GPU is attached — which is what lets the whole
-# 62.14 GiB load happen at **startup**, off GPU time. It also has to precede anything that initializes CUDA.
-import spaces
 import gradio as gr
 
-MODEL_REPO = os.environ.get("MODEL_REPO", "MiniMaxAI/MiniMax-H3")  # public; overridable as a Space variable
-# A rewrite and an encode are booked separately, and both bookings are small. An `xlarge` booking costs twice the
-# seconds it reserves, and a caller ZeroGPU cannot attribute may book at most 120 credits at a time — 60 s of
-# `xlarge` — so a single booking covering both would be refused before any work happened. One forward through 50
-# decoder layers is 2 to 8 seconds.
-GPU_DURATION = int(os.environ.get("GPU_DURATION", "45"))
-GPU_SIZE = os.environ.get("GPU_SIZE", "xlarge")
-ON_SPACES = bool(os.environ.get("SPACE_ID"))
+MODEL_REPO = os.environ.get("MODEL_REPO", "MiniMaxAI/MiniMax-H3")  # public checkpoint
 # The decode budget of a rewrite. A base rewrite lands around 250 tokens and a six-section `ref2va` one around 600;
 # a decode that runs into this budget is trimmed back to its last finished sentence rather than fed in half.
 REWRITE_MAX_NEW_TOKENS = int(os.environ.get("REWRITE_MAX_NEW_TOKENS", "1000"))
-# The rewrite's own booking: one ~10k token prefill plus the decode, 15 to 50 seconds on the pool's card.
-REWRITE_GPU_DURATION = int(os.environ.get("REWRITE_GPU_DURATION", "60"))
 
 # The canvas table shared with the caller; labels are the wire contract.
 # evaluated for the six released aspect ratios. Hardcoded so the UI renders before `diffusers` is importable.
@@ -110,7 +98,7 @@ def status() -> str:
     if LOAD_ERROR:
         return LOAD_ERROR
     if PIPE is None:
-        return f"Loading `{MODEL_REPO}:text_encoder/` (62.14 GiB). Watch the Space logs."
+        return f"Loading `{MODEL_REPO}:text_encoder/` (62.14 GiB). Watch the worker logs."
     return (
         f"Ready · Qwen3-VL conditioner, **bfloat16, unquantized**, {NUM_LAYERS} decoder layers, read at layer 50 · "
         f"loaded in {LOADED_IN:.0f}s · repo `{MODEL_REPO}`"
@@ -125,9 +113,8 @@ def load_models() -> str | None:
     `load_components` resolves each against `modular_model_index.json`, so neither transformer partition nor either
     VAE is ever downloaded here. That is what keeps this Space at 66.7 GB of the 150 GB quota.
 
-    The weights are moved onto the card here as well. These are plain bfloat16 tensors, so ZeroGPU's startup packing
-    (`aten.empty_like(..., pin_memory=True)`) handles them — it is a torchao `Float8Tensor` that does not implement it,
-    and there is none here.
+    The weights are moved onto the card here as well — plain bfloat16 tensors, placed once at startup so the first
+    user request is never penalized (the RunPod default; unlike ZeroGPU there is no packing quota to respect).
     """
     global PIPE, REF2VA_PIPE, LOAD_ERROR, LOADED_IN, NUM_LAYERS
 
@@ -183,18 +170,13 @@ def _refine(refine, *arguments):
         return None
 
 
-@spaces.GPU(duration=REWRITE_GPU_DURATION, size=GPU_SIZE)
 def _rewrite_keyframe_prompt(prompt, image, last_image, num_frames):
-    """The rewrite, on a booking of its own — see the note on `GPU_DURATION`.
-
-    `PIPE` is read as a global rather than passed in: a `@spaces.GPU` argument crosses a process boundary by pickling.
-    """
+    """The rewrite — a plain function on RunPod (the ZeroGPU `@spaces.GPU` booking is gone)."""
     return _refine("refine_keyframe_prompt", PIPE, prompt, image, last_image, num_frames)
 
 
-@spaces.GPU(duration=GPU_DURATION, size=GPU_SIZE)
 def _encode(prompt, image, last_image, height, width):
-    """The only thing on GPU time here: one forward through 50 Qwen3-VL decoder layers.
+    """One forward through 50 Qwen3-VL decoder layers.
 
     `num_frames` is resolved by the caller and never reaches the blocks: this half is `[resize, text_encoder]`, and
     neither step has an opinion about the duration.
@@ -215,9 +197,8 @@ def _encode(prompt, image, last_image, height, width):
 
 
 def caller(request) -> str:
-    """Which ZeroGPU identity this request's booking is charged to, for the log."""
-    headers = getattr(request, "headers", None)
-    return "the caller's own quota" if headers is not None and headers.get("x-ip-token") else "this Space's IP quota"
+    """Kept for log symmetry; between two RunPod workers there is no ZeroGPU quota to attribute."""
+    return "this worker"
 
 
 def encode(prompt, image_path, last_image_path, canvas, num_frames, rewrite_prompt=False, request: gr.Request = None):
@@ -345,12 +326,10 @@ def resolve_reference_num_frames(built, num_frames):
     return resolved
 
 
-@spaces.GPU(duration=REWRITE_GPU_DURATION, size=GPU_SIZE)
 def _rewrite_reference_prompt(prompt, references, num_frames):
-    """The `ref2va` rewrite, on a booking of its own — see the note on `GPU_DURATION`.
+    """The `ref2va` rewrite — a plain function on RunPod.
 
-    The references are handed over as paths and decoded here, as they are for the encode: a `@spaces.GPU` argument
-    crosses a process boundary by pickling, and a 5 s 1344x768 clip is 370 MB of frames once PyAV has expanded it.
+    The references are handed over as paths and decoded here, as they are for the encode.
     """
     built = build_references(references)
     # The rewriter is shown the references it has to write about, so it can name what each one contributes.
@@ -359,9 +338,8 @@ def _rewrite_reference_prompt(prompt, references, num_frames):
     )
 
 
-@spaces.GPU(duration=GPU_DURATION, size=GPU_SIZE)
 def _encode_ref2va(prompt, references, height, width, num_frames):
-    """The only thing on GPU time here: one forward through 50 decoder layers, over the `ref2va` presentation."""
+    """One forward through 50 decoder layers, over the `ref2va` presentation."""
     # A path is decoded as the reference is built, which is where a video picks up its own soundtrack.
     built = build_references(references)
     num_frames = resolve_reference_num_frames(built, num_frames)
@@ -453,7 +431,12 @@ def encode_ref2va(prompt, media, kinds, canvas, num_frames, rewrite_prompt=False
     return path, plan
 
 
-load_models()
+def _boot():
+    """Model load in the background so `/ping` can answer 204 while the 62 GiB encoder downloads/places."""
+    load_models()
+
+
+threading.Thread(target=_boot, daemon=True).start()
 
 INTRO = """# Qwen3-VL conditioner
 
@@ -524,5 +507,27 @@ with gr.Blocks(title="Qwen3-VL conditioner") as demo:
     demo.load(status, None, banner, api_name="status")
 
 
+# RunPod LB health check on the underlying FastAPI app; the gradio app (API routes + inspection UI) mounts at `/`
+# and does not shadow it. 204 while models load, 200 when ready, 5xx pulls the worker from the pool.
+from fastapi.responses import JSONResponse
+
+from fastapi import FastAPI
+
+api = FastAPI(title="Qwen3-VL conditioner")
+
+
+@api.get("/ping")
+def ping():
+    if LOAD_ERROR:
+        return JSONResponse({"status": "error", "detail": LOAD_ERROR}, status_code=500)
+    if PIPE is None:
+        return JSONResponse({"status": "loading"}, status_code=204)
+    return JSONResponse({"status": "ok"}, status_code=200)
+
+
+app = gr.mount_gradio_app(api, demo, path="/")
+
 if __name__ == "__main__":
-    demo.launch(show_error=True, max_threads=1000)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "80")))

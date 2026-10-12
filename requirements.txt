@@ -22,7 +22,7 @@ accelerate==1.14.0
 # diffusers pins <2; 1.24.0 is the version the parity work ran on.
 huggingface-hub==1.24.0
 gradio==6.20.0
-spaces==0.51.1
+# `spaces` intentionally NOT installed: this half has no AoTI path (unlike h3-denoiser, which keeps it for H3_AOTI=1).
 # No `kernels` pin on purpose: the Hub attention backends want `kernels>=0.12.3`, and that version breaks
 # transformers 5.8.0 at import.
 # PyAV: decoding the reference media, i.e. `MiniMaxH3VideoReference.from_file` / `MiniMaxH3AudioReference.from_file`.
