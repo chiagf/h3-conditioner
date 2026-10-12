@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Ubuntu 24.04 system Python is PEP 668 "externally managed" — without this the install aborts with
+# "error: externally-managed-environment". In a container this flag is the correct escape hatch.
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # app.py, h3_split_blocks.py, prompt_rewrite.py — weights download at worker startup.
 COPY *.py ./
